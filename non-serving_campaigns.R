@@ -1,0 +1,163 @@
+library(data.table)
+library(RPostgreSQL)
+library(dplyr)
+library(lubridate)
+
+#create driver object
+drv = dbDriver("PostgreSQL")
+
+#creates and opens a connection to the db
+con1 = dbConnect(drv, dbname = "prodinado", 
+                user = 'tinamccloskey', 
+                password = 'regularalongsiderecordbrilliant',
+                host = 'db.deli.adroll.com',
+                port = '15432')
+
+con2 = dbConnect(drv, dbname = "prodinado", 
+                 user = 'readinado', 
+                 password = 'D54!tufa',
+                 host = '54.148.202.231',
+                 port = '5432')
+
+
+fb_query = paste0( "select c.eid as campaign_eid from campaigns c join deli_effective_budgets90 d on c.eid=d.campaign_eid where 
+					c.status='approved' 
+					and c.start_date> now() - interval '30 days' and c.start_date< now() - interval '2 days' 
+					group by 1
+					having sum(d.spend)=0
+					;" )
+
+fb_campaigns <- dbGetQuery(con1, fb_query)
+
+settings <- dbGetQuery (con2, "select c.eid as campaign_eid
+              , c.name as c_name
+              , to_char(c.start_date,'YYYY-MM-DD') as start_date
+              , round(c.budget*30,2)  as projected_30day_spend
+              , case when c.approved_mirrors like '%f%' then 'FB' else 'Web' end || ' '|| case when c.is_rtb='t' then 'RTB' else 'Console' end  as campaign_type
+              , count(case when adgs.is_active='t' and adgs.is_negative = 'f' then 'targeted' else null end) as targeted_segments
+              , count(case when adgs.is_active='t' and adgs.is_negative = 't' then 'excluded' else null end) as excluded_segments
+              , count (distinct case when adg.status='approved' then adg.id else null end ) as count_adgroups
+              , count (distinct case when adg.status='approved' and ada.status='approved' then ada.id else null end) as count_active_ads
+              FROM 
+              campaigns c 
+              join adgroups adg on c.id=adg.campaign_id 
+              join adgroup_segments adgs on adg.id=adgs.adgroup_id 
+              join adgroup_ads ada on ada.adgroup_id=adg.id
+              where c.status='approved' 
+              and c.start_date> now() - interval '30 days' and c.start_date< now() - interval '2 days' 
+              group by 1,2,3,4,5
+			  			;")
+
+pixel_stuff <- dbGetQuery(con2, "select c.eid as campaign_eid
+						, u.email
+						, adv.url
+						, o.eid as org_eid
+						, adv.eid as adv_eid
+						, adv.name as adv_name
+						, p.status
+						, case when p.status='placed_code' then date_part('day', now()::timestamp - p.placed_code_date::timestamp) else date_part('day', now()::timestamp - p.dropped_code_date::timestamp) end as no_of_days
+						from campaigns c
+						join advertisables adv on c.advertisable_id=adv.id
+						join pixels p on p.advertisable_id=adv.id
+						join organizations o on o.id=adv.organization_id
+						join users u on o.id=u.organization_id  
+						where u.organization_role='admin' and c.status='approved' and c.start_date> now() - interval '30 days' and c.start_date< now() - interval '2 days' 
+						group by 1,2,3,4,5,6,7,8
+						;")
+
+delight <- dbGetQuery(con2, "select c.eid as campaign_eid
+						from campaigns c
+						join advertisables adv on adv.id=c.advertisable_id
+						join organizations o on adv.organization_id=o.id
+						join users ops on o.ops_organization_id=ops.organization_id
+						join users sales on sales.organization_id = o.sales_organization_id
+						where (o.sales_organization_id IN ('8683','29645','105096','105103','86359','86361','86368','86094','86367','86314','105097','86362','105102','86352','86350','105098','86353'
+						) OR sales.role IN ('delight') ) and c.start_date> now() - interval '30 days' and c.start_date< now() - interval '2 days' 
+						group by 1
+						;")
+
+troubled_objects <- dbGetQuery(con2, "Select c.eid as campaign_eid
+					, array_to_string(array_agg(distinct  case 
+						when fa.error_string is not null then 'FA: '||fa.error_string
+						when fc.error_string is not null then 'FC: '||fc.error_string
+						when fas.error_string is not null then 'FAS: '||fas.error_string
+						when fad.error_string is not null then 'FAD: '||fad.error_string 
+						when fad.disapproval_reason is not null then 'FAD: '||fad.disapproval_reason
+						when fca.error_string is not null then 'FCA: '|| fca.error_string
+						when fpx.error_string is not null then 'FPX:'|| fpx.error_string
+						else null end ), ';') as troubled_object
+					from
+					advertisables adv
+					join facebook_accounts fa on adv.id=fa.advertisable_id
+					join organizations o on adv.organization_id=o.id
+					join users u on u.organization_id=o.ops_organization_id
+					join pixels p on adv.id=p.advertisable_id 
+					join segments s on p.id=s.pixel_id 
+					join rules r on s.rule_id=r.id
+					join campaigns c on adv.id=c.advertisable_id
+					join campaign_budget_allocations cba on c.id=cba.campaign_id
+					join adgroups adg on c.id=adg.campaign_id
+					join adgroup_ads ada on adg.id=ada.adgroup_id
+					join ads a on ada.ad_id=a.id
+					join facebook_campaigns fc on c.id = fc.campaign_id 
+					join facebook_adsets fas on adg.id=fas.adgroup_id
+					join adgroup_segments adgs on adg.id=adgs.adgroup_id and s.id=adgs.segment_id
+					join facebook_custom_audiences fca on s.id=fca.segment_id
+					join facebook_adgroups fad on ada.id =fad.adgroup_ad_id 
+					join facebook_pixels fpx on adv.id=fpx.advertisable_id
+					left join facebook_offsite_pixels fop on s.id=fop.segment_id
+					where c.status='approved' and c.start_date> now() - interval '30 days' and c.start_date< now() - interval '2 days' 
+					group by 1
+					;")
+
+prospecting <- dbGetQuery(con2, "select c.eid as campaign_eid
+					, case when c.is_fb_lookalike = 't' OR c.is_coop ='t' OR c.is_pubgraph='t' then 'prospecting' else null end as prospecting 
+					from campaigns c where c.status='approved' group by 1,2;")
+
+advanced_segments <- dbGetQuery(con2, "select distinct c.eid as campaign_eid, array_to_string(array_agg( distinct r.match_method),';') as segment_types
+						from rules r
+						join segments s on r.id =s.rule_id
+						join adgroup_segments ags on ags.segment_id=s.id
+						join adgroups ag on ag.id=ags.adgroup_id
+						join campaigns c on c.id=ag.campaign_id
+						where c.status='approved' and c.start_date> now() - interval '30 days' and c.start_date< now() - interval '2 days' 
+						group by 1;") 
+
+geo_targets <- dbGetQuery(con2, "select c.eid as campaign_eid,
+			array_to_string(array_agg(distinct case 
+				when gt.is_negative='f' and gt.country_id is not null then  co.name
+				when gt.is_negative='f' and gt.region_id is not null then  r.name
+				when gt.is_negative='f' and gt.metro_id is not null then  m.name
+				when gt.is_negative='f' and gt.city_id is not null then  ci.name
+				when gt.is_negative='f' and gt.postal_code_id is not null then 'zipcode_targeting'
+				else null end ), ';') as targeted_geos,
+			array_to_string(array_agg(distinct case 
+				when gt.is_negative='t' and gt.country_id is not null then  co.name
+				when gt.is_negative='t' and gt.region_id is not null then  r.name
+				when gt.is_negative='t' and gt.metro_id is not null then  m.name
+				when gt.is_negative='t' and gt.city_id is not null then  ci.name
+				when gt.is_negative='t' and gt.postal_code_id is not null then 'zipcode_targeting'
+				else null end ), ';') as excluded_geos
+			 from
+			 campaigns c 
+			 join adgroups adg on c.id=adg.campaign_id
+			 left join geo_targets gt on adg.id=gt.adgroup_id
+			 left join countries co on co.id=gt.country_id
+			 left join cities ci on ci.id=gt.city_id
+			 left join regions r on r.id=gt.region_id
+			 left join metros m on m.id=gt.metro_id
+			 left join postal_codes pc on pc.id=gt.postal_code_id
+			 where c.status='approved' and c.start_date> now() - interval '30 days' and c.start_date< now() - interval '2 days'
+			group by 1;")
+
+
+delight_non_serving_campaigns <- fb_campaigns %>%
+  left_join(settings, by = "campaign_eid") %>%
+  left_join(pixel_stuff, by = "campaign_eid") %>%
+  left_join(delight, by = "campaign_eid") %>%
+  left_join(troubled_objects, by = "campaign_eid") %>%
+  left_join(prospecting, by = "campaign_eid") %>%
+  left_join(advanced_segments, by = "campaign_eid") %>%
+  left_join(geo_targets, by = "campaign_eid")
+
+write.csv(delight_non_serving_campaigns, "delight_non_serving_campaigns.csv", row.names=FALSE)
